@@ -1,0 +1,48 @@
+= DlangUI FluidSync & Threading Implementation Plan
+:toc: macro
+:toc-title: Table of Contents
+
+This document outlines the architectural changes necessary within the `dlangui` framework to support high-fidelity, tear-free resizing using the `fluidsync-daemon`, as well as a roadmap for pushing rendering outside of the strict single-threaded paradigm.
+
+toc::[]
+
+== 1. Disabling Internal OS Redraw Smoothing (The "Sizing Trick")
+
+**Branch:** `feature/fluidsync-integration`
+
+Currently, `dlangui` delegates much of the resizing visual load to the OS's native stretch/composite abilities (DWM), causing "ghosting" when the UI is complex. 
+We must wrest control away from the OS and own the resizing operation.
+
+=== Changes
+* Add handlers for `WM_SIZING`, `WM_ENTERSIZEMOVE`, and `WM_EXITSIZEMOVE` inside the `win32window.d` messaging loop wrapper.
+* When `WM_SIZING` is intercepted, call the renderer's `invalidate()` and invoke a synchronous internal redraw call explicitly before passing the handle back to `DefWindowProc`. 
+* Use class styles `CS_VREDRAW` and `CS_HREDRAW` effectively (or intercept `WM_ERASEBKGND` to return a `HBRUSH` matching the theme to prevent flashing).
+
+== 2. Dynamic Budgeting (The "Skeleton" Redraw Phase)
+
+**Branch:** `feature/dynamic-budgeting`
+
+To prevent `WM_SIZING` synchronous calls from destroying responsiveness (e.g., trying to render 10,000 widgets live), `dlangui` must support two-pass rendering driven by the `fluidsync-daemon` telemetry.
+
+=== Changes
+* Introduce an `IUIBudgetProvider` interface connected to an IPC pipe or mapped memory for `fluidsync`.
+* Alter the `Widget.layout()` mechanism. Add a boolean parameter `bool isSkeletonPass` or rely on a framework state variable `Application.getInstance().isUrgentResize()`.
+* When a resize is dragging (urgent mode): 
+  - Standard structural layouts (Margins, VerticalLayouts, Backgrounds) proceed normally.
+  - Deep tree calculations (e.g., Font bounds calculations inside string arrays, heavy child iteration in TableLayout) are skipped or "debounced". 
+  - Caching logic is altered so a widget can return its "last known" texture bounding box instead of recalculating during the skeleton phase.
+
+== 3. Multithreaded Rasterization (The Grand Decoupling)
+
+**Branch:** `feature/multithreaded-renderer`
+
+A single-threaded DlangUI application will always eventually drop frames if layout (CPU calculation) and rasterization (putting pixels in a buffer) occur strictly sequentially. We need an off-main-thread rasterizer.
+
+=== Changes
+* **Thread Parity:** The Main UI Event Thread manages the logical Widget Tree and layout bounds processing. 
+* **Render Thread:** A distinct background thread is spawned per Window that oversees OpenGL contexts or Software rasterization surfaces. 
+* **The Render Queue:** When the Main Thread finishes a layout pass, it freezes a snapshot of the *Display List* (a list of simple primitives: `drawRect`, `drawTextLabel`, `clipBounds`).
+* The Render Thread consumes the Display List and rasterizes it to the backbuffer, allowing the Main Thread to immediately loop back and process the next `WM_MOUSEMOVE` event cleanly without waiting for pixel math to finish.
+
+== Prioritization
+We iterate these features incrementally. First, we lock the frame via OS tricks. Second, we integrate `fluidsync` to prevent lockups. Third, we establish multithreading for the utmost fluidity.
