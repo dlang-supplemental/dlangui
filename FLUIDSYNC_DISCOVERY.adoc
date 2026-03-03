@@ -1,0 +1,67 @@
+= The Path to Fluid Resizing in DlangUI (Discovery & Context)
+:toc: macro
+:toc-title: Table of Contents
+
+This document traces the natural discovery process of identifying rendering bottlenecks, composing their solutions, and understanding the reasoning behind the `fluidsync-daemon` architecture. For the strict technical implementation requirements, please see `FLUIDSYNC_PLAN.adoc`.
+
+toc::[]
+
+== Observation: Why Do Window Contents "Ghost" on Window Resize?
+
+When you grab the edge of a complex desktop application and resize it, you might notice the user interface temporarily "ghosting" or pulling away from the mouse cursor. Instead of locking perfectly to the border, the application's contents smear or lag behind.
+
+This happens because of a tug-of-war between the Operating System and the UI framework. When the window expands, the OS (like the Windows Desktop Window Manager) wants to fill the new empty space immediately. Because the application hasn't had time to redraw its complex layout at the new size, the OS simply takes the old "picture" (the backbuffer) of the application and stretches it to fit the new dimensions. 
+
+This creates the cheap-looking pulling effect, lasting for the few milliseconds it takes the UI to catch up and present the newly drawn frame.
+
+== Step 1: Taking Back Control (The Sizing Trick)
+
+To fix the ghosting, we must wrest control away from the OS. We need to tell the OS: *"Do not stretch the old pixels; wait for me to draw the new ones right now."*
+
+In the Windows API, this is done by intercepting messages like `WM_SIZING`. Every time the user moves the mouse a single pixel while dragging the border, the OS sends this message. By catching it, forcing `dlangui` to recalculate the layout, redrawing the window, and forcefully pushing the update back to the screen *before* returning control to the OS, we eliminate the stretching. The window border and the application contents are now locked together synchronously.
+
+== Step 2: The Consequence of Control (Stutter)
+
+Unfortunately, fixing the ghosting introduces a new, often worse, problem: a laggy, stuttering mouse cursor.
+
+`dlangui` is a single-threaded framework. If you have a massive table with thousands of rows, calculating where every piece of text and every border should go takes time—perhaps 20 milliseconds. However, a 60Hz monitor demands a new frame every 16.6 milliseconds, and a 144Hz monitor needs one every 6.9 milliseconds.
+
+If the math takes longer than the physical time you have between mouse movements, the entire thread locks up. The user feels this as "heavy" or stuttering window resizing because the application is failing to process the next mouse drag event while it desperately tries to calculate the current layout.
+
+== Step 3: The Compromise (Two-Pass Skeleton Rendering)
+
+We cannot do all the heavy math during every single pixel of a resize drag, but we also cannot let the OS stretch our pixels. The solution is to decouple the urgent "structural" drawing from the heavy "detail" drawing.
+
+During a resize operation, the framework must enter an "Urgent Mode".
+Instead of measuring every piece of text, `dlangui` will only execute a fast **Skeleton Pass**. It will quickly draw the background colors, the main toolbars, and the sidebar containers. For deep, complex details (like text within a list), it will either skip them, clip them, or use a cached texture.
+
+Once the user stops dragging the window (or pauses for a few milliseconds), the framework runs the **Detail Pass**, calculating the heavy text mathematics and drawing the final crisp interface. The window moves smoothly because calculating three big rectangles takes virtually no processing power.
+
+== Step 4: The Measurement Dilemma
+
+There is a glaring hole in the Two-Pass logic: *How does `dlangui` know when a frame is getting too heavy?* How does it know exactly when to abort the Detail Pass and fall back to the Skeleton Pass to avoid stuttering?
+
+It needs a strict time budget. If the system guarantees we will not drop frames (specifically avoiding "1% lows" that cause stutter), we must perfectly predict the layout cost.
+
+If `dlangui` tries to ask the OS natively, *"What is the monitor's refresh rate, what is the current CPU thermal load, and how long did the GPU take to present the last frame?"* the very act of asking those questions via System Calls takes so long that it ruins the time budget we are trying to protect.
+
+== Step 5: The Orchestrator (`fluidsync-daemon`)
+
+We cannot ask the OS for hardware metrics during the critical render loop. Instead, we externalize the problem.
+
+Enter the **FluidSync GUI Daemon**. This is an independent background server running alongside the OS. 
+1. The daemon slowly gathers all the heavy system analytics (CPU state, frame presentation latency).
+2. It aggregates these metrics into a simple "Dynamic Render Budget".
+3. It writes this budget directly to a tiny chunk of **Shared Memory**.
+
+Now, when `dlangui` handles a `WM_SIZING` event, it does not do complex system profiling. It simply reads a few bytes from shared memory (which has zero system-call overhead and takes a nanosecond), sees that the current budget is "Urgent", and instantly falls back to the Skeleton Pass. 
+
+== Step 6: The Ultimate Fix (Multithreaded Rasterization)
+
+Even with perfect budgets dictated by an external daemon, a single-threaded architecture implies that *Layout Calculation* and *Pixel Rasterization* wait on each other sequentially. To reach the absolute pinnacle of fluidity, they must be separated.
+
+The grand decoupling involves splitting the workload:
+* **The UI Main Thread:** Exclusively handles input events, interprets the FluidSync budget, and calculates widget layout numbers. Once it knows *where* things go, it freezes those instructions into a flat, lightweight "Display List" (e.g., `DrawRect(x,y,w,h)`).
+* **The Render Thread:** A separate background thread consumes that Display List and executes the actual OpenGL or Software drawing commands, painting the pixels to the screen.
+
+Because the Main Thread just hands off a list of instructions and immediately loops back to handle the next mouse drag event, the application logic literally cannot stutter, regardless of how complex the final pixels are to paint.
