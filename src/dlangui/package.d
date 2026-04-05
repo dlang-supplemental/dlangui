@@ -71,6 +71,7 @@ public {
     import dlangui.widgets.srcedit;
     import dlangui.widgets.grid;
     import dlangui.widgets.tree;
+    import dlangui.widgets.processoutput;
     import dlangui.widgets.combobox;
     import dlangui.widgets.popup;
     import dlangui.widgets.appframe;
